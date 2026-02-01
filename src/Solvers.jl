@@ -277,6 +277,54 @@ function OZSolverCache(system, method, needs_dispersion::Bool)
     return OZSolverCache(mayer_f, fourierplan, r, k, βu_dispersion_tail, βu, Γhat, C, Ĉ, Γ_new)
 end
 
+
+#new
+struct OZSolverCache_no_fourier{T, S}
+    mayer_f::Vector{T}
+    #fourierplan::F
+    r::Vector{S}
+    #k::Vector{S}
+    βu_dispersion_tail::Vector{T}
+    βu::Vector{T}
+    Γhat::Vector{T}
+    C::Vector{T}
+    Ĉ::Vector{T}
+    Γ_new::Vector{T}
+end
+
+OZSolverCache_no_fourier(system, method) = OZSolverCache_no_fourier(system, method, true)
+
+function OZSolverCache_no_fourier(system, method, needs_dispersion::Bool)
+    r = method.dr * (1:method.M) |> collect
+    βu1 = needs_dispersion ? first(evaluate_long_range_potential(system.potential, system.kBT, r[1])) : evaluate_potential(system.potential, r[1]) / system.kBT
+    elementtype = typeof(r[1] .* system.kBT .* system.ρ .* βu1)
+    mayer_f = zeros(elementtype, length(r))
+    #fourierplan = get_fourier_plan(system, method, mayer_f)
+    #r .= fourierplan.r # in the case that dims != 3, we need to use the right grid
+    #k = fourierplan.k
+    βu = similar(mayer_f)
+    βu_dispersion_tail = similar(mayer_f)
+
+    if needs_dispersion
+        βu_raw, βu_disp_raw = evaluate_long_range_potential(system.potential, system.kBT, r)
+        βu .= βu_raw
+        βu_dispersion_tail .= βu_disp_raw
+    else
+        βu_potential = evaluate_potential(system.potential, r)
+        βu .= βu_potential ./ system.kBT
+        fill!(βu_dispersion_tail, zero(eltype(βu_dispersion_tail)))
+    end
+
+    mayer_f .= find_mayer_f_function.((system,), βu)
+
+    Γhat = copy(mayer_f); Γ_new = copy(mayer_f)
+    C = copy(mayer_f); Ĉ = copy(mayer_f)
+
+    mayer_f, βu_dispersion_tail, βu, Γhat, C, Ĉ, Γ_new = promote(mayer_f, βu_dispersion_tail, βu, Γhat, C, Ĉ, Γ_new)
+
+    return OZSolverCache_no_fourier(mayer_f, r, βu_dispersion_tail, βu, Γhat, C, Ĉ, Γ_new)
+end
+
 # gets one iteration step of the OZ equation in k-space
 # computes Γ_new from C
 # overwrites Ĉ, Γhat, Γ_new

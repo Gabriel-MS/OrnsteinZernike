@@ -81,3 +81,25 @@ function split_coulomb_potential(r::Real, system::SimpleChargedSystem, CS::Ewald
     βu_short_range = z * z' * ℓB * (1 - erfpart) / r
     return βu_short_range, βu_long_range
 end
+
+"""
+    evaluate_coulomb_potential_derivative(r, system::SimpleChargedSystem)
+
+Compute the radial derivative ∂(βu_Coulomb)/∂r for the pairwise Coulomb potential:
+
+    βu(r) = (z_i z_j ℓB) / r
+
+so that
+
+    ∂βu/∂r = - (z_i z_j ℓB) / r²
+"""
+function evaluate_coulomb_potential_derivative(r::Real, system::SimpleChargedSystem)
+    @assert dims_of(system) == 3 "Coulomb derivative only implemented in 3D."
+    z = system.z
+    ℓB = system.ℓB
+    return -z * z' * ℓB / (r^2)
+end
+
+function evaluate_coulomb_potential_derivative(r::AbstractVector, system::SimpleChargedSystem)
+    return [evaluate_coulomb_potential_derivative(ri, system) for ri in r]
+end

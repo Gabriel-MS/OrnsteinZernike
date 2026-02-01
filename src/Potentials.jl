@@ -7,6 +7,108 @@ Abstract potential type
 abstract type Potential end
 
 
+
+#######################
+# Custom Coulomb Potential
+#######################
+
+"""
+    CustomCoulomb(z, ℓB)
+
+Coulomb potential:
+
+    u_ij(r) = z_i * z_j * ℓB / r
+
+Accepts either a single charge `z::Number` or a vector of charges `z::AbstractVector`.
+"""
+struct CustomCoulomb{Tz} <: Potential
+    z::Tz
+    ℓB::Float64
+end
+
+CustomCoulomb(z::Number, ℓB::Float64) = CustomCoulomb([z], ℓB)
+CustomCoulomb(z::AbstractVector{<:Number}, ℓB::Float64) = CustomCoulomb{typeof(z)}(z, ℓB)
+
+function evaluate_potential(p::CustomCoulomb, r::Number)
+    z = p.z
+    ℓB = p.ℓB
+
+    if length(z) == 1
+        return z[1]^2 * ℓB / r
+    else
+        # multi-component: outer product z_i*z_j
+        return (z .* z') * ℓB / r
+    end
+end
+
+function evaluate_potential_derivative(p::CustomCoulomb, r::Number)
+    z = p.z
+    ℓB = p.ℓB
+
+    if length(z) == 1
+        return - z[1]^2 * ℓB / r^2
+    else
+        return - (z .* z') * ℓB / r^2
+    end
+end
+
+evaluate_potential(p::CustomCoulomb, r::AbstractVector) = [evaluate_potential(p, ri) for ri in r]
+evaluate_potential_derivative(p::CustomCoulomb, r::AbstractVector) = [evaluate_potential_derivative(p, ri) for ri in r]
+
+discontinuities(::CustomCoulomb) = Float64[]
+
+function dispersion_tail(::CustomCoulomb, kBT, r::Number, βu)
+    return zero(βu)
+end
+
+
+"""
+    CompositePotential
+
+Composite potential: sum of multiple potentials (e.g., HardSpheres + GaussianCore1 + GaussianCore2)
+Supports mixtures and different pairwise parameters.
+"""
+struct CompositePotential{Ps<:Tuple} <: Potential
+    potentials::Ps
+end
+
+# Constructor: accepts any number of potentials
+CompositePotential(pots::Vararg{Potential,N}) where N = CompositePotential{Tuple{Vararg{Potential,N}}}(pots)
+
+# Evaluate total potential at scalar r
+function evaluate_potential(p::CompositePotential, r::Number)
+    # Evaluate each potential
+    u = evaluate_potential(first(p.potentials), r)
+    for pot in Iterators.rest(p.potentials)
+        u = u + evaluate_potential(pot, r)  # elementwise sum (broadcast)
+    end
+    return u
+end
+
+
+# Evaluate derivative of total potential at scalar r
+function evaluate_potential_derivative(p::CompositePotential, r::Number)
+    du = evaluate_potential_derivative(first(p.potentials), r)
+    for pot in Iterators.rest(p.potentials)
+        du = du + evaluate_potential_derivative(pot, r)
+    end
+    return du
+end
+
+# Discontinuities: union of all potentials
+function discontinuities(p::CompositePotential)
+    discs = Float64[]
+    for pot in p.potentials
+        append!(discs, discontinuities(pot))
+    end
+    return discs
+end
+
+function dispersion_tail(p::CompositePotential, kBT, r::Number, βu)
+    return zero(βu)
+end
+
+
 """
     HardSpheres
 
@@ -92,7 +194,6 @@ function evaluate_potential(potential::LennardJones, r::Number)
     return @. 4ϵ * ((σ/r)^12 - (σ/r)^6)
 end
 
-
 """
     InversePowerLaw
 
@@ -123,6 +224,140 @@ function dispersion_tail(p::InversePowerLaw, kBT, r::Number, βu)
 end
 
 """
+    WCAmixture
+
+Implements the Weeks-Chandler-Andersen pair interaction \$u(r) = 4\\epsilon [(\\sigma/r)^{12} - (\\sigma/r)^6 - 1]\$ for \$r>2^{1/2}\\sigma\$ and \$0\$ otherwise.
+
+Expects values `ϵ`, `σ`, and `n`, which respecively are the strength of the potential and particle size. 
+
+Example:
+```julia
+potential = WCA(1.0, 2.0)
+```
+"""
+struct WCAMixture{Tϵ,Tσ} <: Potential
+    ϵ::Tϵ
+    σ::Tσ
+end
+
+WCAMixture(ϵ::Number, σ::Number) =
+    WCAMixture{typeof(ϵ),typeof(σ)}(ϵ, σ)
+
+function WCAMixture(ϵ::AbstractVector{Tϵ}, σ::AbstractVector{Tσ}) where {Tϵ<:Number,Tσ<:Number}
+    @assert length(ϵ) == length(σ)
+    N  = length(ϵ)
+    ϵs = SVector{N,Float64}(ϵ)
+    σs = SVector{N,Float64}(σ)
+
+    ϵij = sqrt.(ϵs * ϵs')
+    σij = (σs .+ σs') ./ 2
+
+    return WCAMixture{typeof(ϵij),typeof(σij)}(ϵij, σij)
+end
+
+function WCAMixture(ϵij::AbstractMatrix{Tϵ}, σij::AbstractMatrix{Tσ}) where {Tϵ<:Number,Tσ<:Number}
+    @assert size(ϵij,1) == size(ϵij,2) == size(σij,1) == size(σij,2)
+    N  = size(ϵij,1)
+
+    ϵM = SMatrix{N,N,Float64}(ϵij)
+    σM = SMatrix{N,N,Float64}(σij)
+
+    return WCAMixture{typeof(ϵM),typeof(σM)}(ϵM, σM)
+end
+
+
+function evaluate_potential(p::WCAMixture, r::Number)
+    ϵ, σ = p.ϵ, p.σ
+    rc = σ .* 2.0^(1/6)
+
+    return @. ifelse(
+        r <= rc,
+        4ϵ * ((σ / r)^12 - (σ / r)^6 - 1.0),
+        zero(ϵ)
+    )
+end
+
+function evaluate_potential_derivative(p::WCAMixture, r::Number)
+    ϵ, σ = p.ϵ, p.σ
+    rc = σ .* 2.0^(1/6)
+
+    return @. ifelse(
+        r <= rc,
+        4ϵ * (-12*(σ^12)/r^13 + 6*(σ^6)/r^7),
+        zero(ϵ)
+    )
+end
+
+function discontinuities(p::WCAMixture)
+    σ = p.σ
+    rc = σ .* 2.0^(1/6)
+
+    if rc isa AbstractArray
+        return vec(float.(rc))
+    else
+        return [float(rc)]
+    end
+end
+
+
+function dispersion_tail(::WCAMixture, kBT, r::Number, βu)
+    return zero(βu)
+end
+
+"""
+    MieMixture
+
+Implements the Mie pair interaction:
+    u(r) = C * ϵ * [(σ/r)^n - (σ/r)^m]
+    where C = (n/(n-m)) * (n/m)^(m/(n-m))
+
+Constructors support single-component, mixtures via mixing rules, or explicit matrices.
+"""
+struct MieMixture{Tϵ, Tσ, Tn, Tm} <: Potential
+    ϵ::Tϵ
+    σ::Tσ
+    n::Tn
+    m::Tm
+end
+
+# Helper to calculate the pre-factor C
+function mie_prefactor(n, m)
+    return (n / (n - m)) * (n / m)^(m / (n - m))
+end
+
+# Constructor for mixtures from vectors (standard Lorentz-Berthelot-like rules)
+function MieMixture(ϵ::AbstractVector{Tϵ}, σ::AbstractVector{Tσ}, n::Number, m::Number=6.0) where {Tϵ<:Number, Tσ<:Number}
+    @assert length(ϵ) == length(σ)
+    N = length(ϵ)
+    ϵs = SVector{N,Float64}(ϵ)
+    σs = SVector{N,Float64}(σ)
+
+    # Mixing rules
+    ϵij = sqrt.(ϵs * ϵs')        # Geometric mean for energy
+    σij = (σs .+ σs') ./ 2.0    # Arithmetic mean for size
+    
+    return MieMixture{typeof(ϵij), typeof(σij), typeof(n), typeof(m)}(ϵij, σij, n, m)
+end
+
+function evaluate_potential(p::MieMixture, r::Number)
+    ϵ, σ, n, m = p.ϵ, p.σ, p.n, p.m
+    C = mie_prefactor(n, m)
+    return @. C * ϵ * ((σ / r)^n - (σ / r)^m)
+end
+
+function evaluate_potential_derivative(p::MieMixture, r::Number)
+    ϵ, σ, n, m = p.ϵ, p.σ, p.n, p.m
+    C = mie_prefactor(n, m)
+    return @. C * ϵ * (-n * (σ^n) / r^(n+1) + m * (σ^m) / r^(m+1))
+end
+
+discontinuities(::MieMixture) = Float64[]
+
+function dispersion_tail(::MieMixture, kBT, r::Number, βu)
+    return zero(βu)
+end
+
+"""
     WCA
 
 Implements the Weeks-Chandler-Andersen pair interaction \$u(r) = 4\\epsilon [(\\sigma/r)^{12} - (\\sigma/r)^6 - 1]\$ for \$r>2^{1/2}\\sigma\$ and \$0\$ otherwise.
@@ -148,6 +383,87 @@ end
 function dispersion_tail(p::WCA, kBT, r::Number, βu)
     return zero(βu)
 end
+
+
+struct InversePowerLawMixture{Tϵ,Tσ,Tn} <: Potential 
+    ϵ::Tϵ
+    σ::Tσ
+    n::Tn
+end
+
+"""
+    InversePowerLawMixture
+
+Implements the inverse power-law pair interaction
+
+    u₍ᵢⱼ₎(r) = ϵ₍ᵢⱼ₎ * (σ₍ᵢⱼ₎ / r)ⁿ
+
+Supports single-component, multi-component mixtures with mixing rules, or explicit pair tables.
+
+Constructors:
+- `InversePowerLawMixture(ϵ::Number, σ::Number, n::Number)` — single-component
+- `InversePowerLawMixture(ϵ::AbstractVector, σ::AbstractVector, n::Number)` — mixture with geometric/arithmetic mixing rules
+- `InversePowerLawMixture(ϵij::AbstractMatrix, σij::AbstractMatrix, n::Number)` — explicit pair tables
+
+Example:
+```julia
+# single-component
+potential = InversePowerLawMixture(1.0, 2.0, 8)
+
+# mixture with vectors
+ϵ_vec = [1.0, 0.5]
+σ_vec = [2.0, 3.0]
+potential = InversePowerLawMixture(ϵ_vec, σ_vec, 8)
+
+# mixture with explicit pair tables
+ϵij = [1.0 0.7; 0.7 0.5]
+σij = [2.0 2.5; 2.5 3.0]
+potential = InversePowerLawMixture(ϵij, σij, 8)
+"""
+# --- scalar constructor ---
+InversePowerLawMixture(ϵ::Number, σ::Number, n::Number) = InversePowerLawMixture{typeof(ϵ), typeof(σ), typeof(n)}(ϵ, σ, n)
+
+# --- mixture from vectors (mixing rules) ---
+function InversePowerLawMixture(ϵ::AbstractVector{Tϵ}, σ::AbstractVector{Tσ}, n::Number) where {Tϵ<:Number, Tσ<:Number}
+    @assert length(ϵ) == length(σ) "ϵ and σ vectors must have same length"
+    N = length(ϵ)
+    ϵs = collect(ϵ) .|> float
+    σs = collect(σ) .|> float
+    ϵij = sqrt.(ϵs .* (ϵs'))           # geometric mean
+    σij = (σs .+ (σs')) ./ 2.0         # arithmetic mean
+    ϵM = SMatrix{N,N,Float64}(ϵij)
+    σM = SMatrix{N,N,Float64}(σij)
+    return InversePowerLawMixture{typeof(ϵM), typeof(σM), typeof(n)}(ϵM, σM, n)  # ✅ call type constructor directly
+end
+
+# --- mixture from explicit pair tables ---
+function InversePowerLawMixture(ϵij::AbstractMatrix{Tϵ}, σij::AbstractMatrix{Tσ}, n::Number) where {Tϵ<:Number, Tσ<:Number}
+    @assert size(ϵij,1) == size(ϵij,2) == size(σij,1) == size(σij,2)
+    N = size(ϵij,1)
+    ϵM = SMatrix{N,N,Float64}(float.(ϵij))
+    σM = SMatrix{N,N,Float64}(float.(σij))
+    return InversePowerLawMixture{typeof(ϵM), typeof(σM), typeof(n)}(ϵM, σM, n)  # ✅ call type constructor directly
+end
+
+# --- evaluate potential ---
+function evaluate_potential(p::InversePowerLawMixture, r::Number)
+    ϵ, σ, n = p.ϵ, p.σ, p.n
+    return @. ϵ * (σ / r)^n
+end
+
+function evaluate_potential_derivative(p::InversePowerLawMixture, r::Number)
+    ϵ, σ, n = p.ϵ, p.σ, p.n
+    return @. -n * ϵ * (σ^n) / (r^(n+1))
+end
+
+discontinuities(::InversePowerLawMixture) = Float64[]
+
+function dispersion_tail(::InversePowerLawMixture, kBT, r::Number, βu)
+    return zero(βu)
+end
+
+
+
 
 """
     CustomPotential
@@ -216,7 +532,7 @@ function evaluate_potential_derivative(potential::Potential, r::Number)
 
     u2 = evaluate_potential(potential, r+ϵ)
     u1 = evaluate_potential(potential, r-ϵ)
-    if isinf(u2) && isinf(u1)
+    if any(isinf,u2) && any(isinf,u1)
         return zero(u2)
     end
     return (u2-u1)/(2ϵ)
@@ -296,6 +612,86 @@ function evaluate_potential_derivative(p::Yukawa, r::Number)
 end
 
 discontinuities(::Yukawa) = Float64[]
+
+
+#############################################
+# Gaussian Model (GM) — with mixtures #
+#############################################
+
+"""
+    Gaussian
+
+Gaussian (ultrasoft) pair interaction
+
+    u(r) = ϵ * exp(-(r - μ)^2 / (2 * σ^2)
+
+Constructors:
+- `Gaussian(ϵ::Number, σ::Number, μ::Number)` — single-component
+- `Gaussian(ϵ::AbstractVector, σ::AbstractVector, μ::AbstractVector)` — mixture with
+   σ_ij = √(σ_i σ_j) (geometric mean), ϵ_ij = (ϵ_i + ϵ_j)/2 (additive), μ_ij = (μ_i + μ_j)/2 (additive)
+- `Gaussian(ϵ::AbstractMatrix, σij::AbstractMatrix, μij::AbstractMatrix)` — explicit pair tables
+
+Example:
+```julia
+potential = Gaussian(1.0, 1.5, 0.5)
+```
+
+Example (mixture with mixing rules):
+```julia
+eps = [1.0, 0.8]
+sig = [1.0, 1.2]
+mi = [2.0, 3.2]
+potential = Gaussian(eps, sig, mi)
+```
+"""
+struct Gaussian{TE,TS,TU} <: Potential
+    ϵ::TE
+    σ::TS
+    μ::TU
+
+    Gaussian(ϵ::Number, σ::Number, μ::Number) = new{typeof(ϵ),typeof(σ),typeof(μ)}(ϵ, σ, μ)
+
+    function Gaussian(ϵ::AbstractVector{T1}, σ::AbstractVector{T2}, μ::AbstractVector{T3}) where {T1<:Number,T2<:Number,T3<:Number}
+        @assert length(ϵ) == length(σ)
+        @assert length(ϵ) == length(μ)
+        N  = length(ϵ)
+        ϵs = SVector{N,T1}(ϵ)
+        σs = SVector{N,T2}(σ)
+        μs = SVector{N,T3}(μ)
+        ϵij = (ϵs .+ ϵs') / 2
+        σij = sqrt.(σs * σs')
+        μij = (μs .+ μs') / 2
+        return new{typeof(ϵij), typeof(σij), typeof(μij)}(ϵij, σij, μij)
+    end
+
+    function Gaussian(ϵij::AbstractMatrix{T1}, σij::AbstractMatrix{T2}, μij::AbstractMatrix{T3}) where {T1<:Number,T2<:Number,T3<:Number}
+        @assert size(ϵij,1)==size(ϵij,2)==size(σij,1)==size(σij,2)==size(μij,1)==size(μij,2)
+        N  = size(ϵij,1)
+        ϵM = SMatrix{N,N,T1}(ϵij)
+        σM = SMatrix{N,N,T2}(σij)
+        μM = SMatrix{N,N,T3}(μij)
+        return new{typeof(ϵM), typeof(σM), typeof(μM)}(ϵM, σM, μM)
+    end
+end
+
+function evaluate_potential(p::Gaussian, r::Number)
+    ϵ, σ, μ = p.ϵ, p.σ, p.μ
+    return ϵ .* exp.(- ((r .- μ).^2) ./ (2 .* σ.^2))
+end
+
+# du/dr = u(r) .* ( - (r .- μ) ./ (σ.^2) )
+function evaluate_potential_derivative(p::Gaussian, r::Number)
+    ϵ, σ, μ = p.ϵ, p.σ, p.μ
+    u = ϵ .* exp.(- ((r .- μ).^2) ./ (2 .* σ.^2))
+    return u .* ( - (r .- μ) ./ (σ.^2) )
+end
+
+discontinuities(::Gaussian) = Float64[]
+
+function dispersion_tail(p::Gaussian, kBT, r::Number, βu)
+    return zero(βu)
+end
+
 
 
 #############################################

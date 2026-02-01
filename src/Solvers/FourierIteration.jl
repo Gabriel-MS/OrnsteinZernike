@@ -91,7 +91,8 @@ function solve(system::SimpleChargedSystem, closure::Closure, method::FourierIte
     if isnothing(gamma_0)
         fill!(Γ_SR_old, zero(eltype(Γ_SR_old)))
     else
-        Γ_SR_old .= gamma_0 .* r .- Q .+ Φ # gamma_0 is full gamma, we need short ranged part
+        #Γ_SR_old .= gamma_0 .* r .- Q .+ Φ # gamma_0 is full gamma, we need short ranged part
+        Γ_SR_old .= gamma_0 .* r .- Q .+ (φ .* r) # gamma_0 is full gamma, we need short ranged part
     end
 
     max_iterations = method.max_iterations

@@ -145,7 +145,7 @@ function solve(system::SimpleChargedSystem, closure::Closure, method::NgIteratio
 
     if !(isnothing(gamma_0))
         for i = eachindex(fn_full[end])
-            fn_full[end][i] = (gamma_0[i] * r[i]) - Q[i] + Φ[i] # initial guess includes long range part
+            fn_full[end][i] = (gamma_0[i] .* r[i]) .- Q[i] .+ (φ[i] .* r[i])#Φ[i] # initial guess includes long range part
         end
     else
         fill!(fn_full[end], zero(T))
@@ -219,6 +219,166 @@ function solve(system::SimpleChargedSystem, closure::Closure, method::NgIteratio
     γ = Γ_SR_new ./ r + q - φ
     γ̂ = Γ_SR_hat ./ k + q_hat - φ_hat
     return construct_solution(r, k, c, ĉ, γ, γ̂, ρ)
+end
+
+function solve(system::SimpleChargedSystem, closure::Closure, method::NgIteration, systems; λ_values, gamma_0=nothing, coulombsplitting=NoCoulombSplitting())
+    N_stages = method.N_stages
+    ρ = ρ_of(system)
+
+    renorm = uses_renormalized_gamma(closure)
+
+    Nsols = length(λ_values)
+    solutions = Vector{OZSolution{Vector{Float64}, Array{Float64,3}}}(undef, Nsols)
+
+    cache = OZSolverCache(base_of(system), method, renorm)
+    mayer_f, fourierplan, r, k, βu_LR_disp, βu, Γ_SR_hat, C_SR, C_SR_hat, Γ_SR_new = 
+        cache.mayer_f, cache.fourierplan, cache.r, cache.k, cache.βu_dispersion_tail, cache.βu, cache.Γhat, cache.C, cache.Ĉ, cache.Γ_new
+
+    for ll in 1:Nsols
+        #println(ll)
+        #update system with new λ
+        system = systems[ll]
+
+        #working
+        cache = OZSolverCache(base_of(system), method, renorm)
+        mayer_f, fourierplan, r, k, βu_LR_disp, βu = 
+            cache.mayer_f, cache.fourierplan, cache.r, cache.k, cache.βu_dispersion_tail, cache.βu
+        
+        #new test
+        #cache = OZSolverCache_no_fourier(base_of(system), method)
+        #mayer_f, r, βu_LR_disp, βu = 
+        #    cache.mayer_f, cache.r, cache.βu_dispersion_tail, cache.βu
+
+        βu_SR_coul, βu_LR_coul = split_coulomb_potential(r, system, coulombsplitting)
+        βu = βu .+ βu_SR_coul .+ βu_LR_coul
+        mayer_f .= find_mayer_f_function.(βu)
+
+        φ = -βu_LR_coul # long range part of c 
+        Φ_hat = fourier(φ .* r, fourierplan)  # note that the FT work on the "mulr" functions
+        φ_hat = Φ_hat ./ k
+
+        q_hat = [(I - φ_hat[i] * ρ) \ φ_hat[i] for i in eachindex(φ_hat)] # q_hat = (I - φ_hat * ρ)^(-1) * φ_hat
+        Q_hat = q_hat .* k # mul_r function
+        Q = inverse_fourier(Q_hat, fourierplan)
+        q = Q ./ r
+
+        # capital letters are multiplied by r or k
+        C_hat = 0.0copy(mayer_f); Γ_hat = 0.0copy(mayer_f) 
+
+        T = eltype(mayer_f)
+        TT = T <: Number ? T : eltype(T)
+        A = zeros(TT, N_stages, N_stages)
+        b = zeros(TT, N_stages)
+
+        # if T <: AbstractMatrix, we need to store gi as a vector of matrices
+        # if T <: Number, we need to store gi as a vectors of numbers 
+        gn_full = [copy(mayer_f) for _ in 1:N_stages+1] # first element is g_n, second is g_{n-1} etc
+        fn_full = [copy(mayer_f) for _ in 1:N_stages+1]
+        dn_full = [copy(mayer_f) for _ in 1:N_stages+1]
+        d0n_full = [copy(mayer_f) for _ in 1:N_stages] # first element is d01 second is d02 etc
+
+        # flattened arrays!!
+        # if T <: Number, flatten_array is identity
+        gn_flat = [flatten_array(gn_full[i]) for i in eachindex(gn_full)]
+        fn_flat = [flatten_array(fn_full[i]) for i in eachindex(fn_full)]
+        dn_flat = [flatten_array(dn_full[i]) for i in eachindex(dn_full)]
+        d0n_flat = [flatten_array(d0n_full[i]) for i in eachindex(d0n_full)]
+        Γ_SR_new_flat = flatten_array(Γ_SR_new)
+
+        #if !(isnothing(gamma_0))
+        #    for i = eachindex(fn_full[end])
+        #        fn_full[end][i] = (gamma_0[i] .* r[i]) .- Q[i] .+ (φ[i] .* r[i])#Φ[i] # initial guess includes long range part
+        #    end
+        #else
+        #    fill!(fn_full[end], zero(T))
+        #end
+        
+        if ll>1
+            fn_full[end] .= Γ_SR_new
+        else
+            fill!(fn_full[end], zero(T))
+        end
+
+        #if ll > 1
+        #    # Copy the converged solution from previous λ
+        #    fn_full[end] .= Γ_SR_new
+        #end
+
+        max_iterations = method.max_iterations
+        tolerance = method.tolerance
+
+        err = tolerance * 2
+        iteration = 0
+        # first bootstrapping steps 
+        for stage = reverse(1:N_stages)
+            ctx_stage = ChargedClosureEvalContext(r, mayer_f, fn_full[stage+1], βu, βu_LR_disp, βu_LR_coul, q)
+            closure_apply!(C_SR, closure, ctx_stage)
+            fourier!(C_SR_hat, C_SR, fourierplan)
+            C_hat .= C_SR_hat .+ Φ_hat
+            for ik in eachindex(Γ_hat)
+                Γ_hat[ik] = (I*k[ik] - C_hat[ik] * ρ) \ (C_hat[ik] * ρ * C_hat[ik]) 
+            end
+            Γ_SR_hat .= Γ_hat .- (Q_hat .- Φ_hat) 
+            inverse_fourier!(gn_full[stage+1], Γ_SR_hat, fourierplan)
+            fn_flat[stage] .= gn_flat[stage+1]
+        end
+
+        while err > tolerance
+            if iteration > max_iterations || isnan(err)
+                error("Recursive iteration did not converge within $iteration steps. Current error = $err.")
+            end
+
+            ctx_iter = ChargedClosureEvalContext(r, mayer_f, fn_full[1], βu, βu_LR_disp, βu_LR_coul, q)
+            closure_apply!(C_SR, closure, ctx_iter)
+            fourier!(C_SR_hat, C_SR, fourierplan)
+            C_hat .= C_SR_hat .+ Φ_hat
+            for ik in eachindex(Γ_hat)
+                Γ_hat[ik] = (I*k[ik] - C_hat[ik] * ρ) \ (C_hat[ik] * ρ * C_hat[ik]) 
+            end
+            Γ_SR_hat .= Γ_hat .- (Q_hat .- Φ_hat) 
+            inverse_fourier!(Γ_SR_new, Γ_SR_hat, fourierplan)
+
+            gn_flat[1] .= Γ_SR_new_flat
+            err = compute_error(gn_flat[1], fn_flat[1])
+            if method.verbose && iteration % 1 == 0
+                println("After iteration $iteration, the error is $(round(err, digits=ceil(Int, 1-log10(tolerance)))).")
+            end
+            for stage = 1:N_stages+1
+                @. dn_flat[stage] = gn_flat[stage] - fn_flat[stage]
+            end
+            for stage = 1:N_stages
+                @. d0n_flat[stage] = dn_flat[1] - dn_flat[stage+1]
+            end
+            if isnan(err)
+                error("Encountered NaN in the solution after $iteration iterations.")
+            end
+            coefficients = find_Ng_coefficients(A, b, N_stages, d0n_flat, dn_flat, r)
+            update_Γ_new_Ng!(Γ_SR_new_flat, coefficients, gn_flat)
+
+            for stage = reverse(1:N_stages)
+                gn_flat[stage+1] .= gn_flat[stage]
+                fn_flat[stage+1] .= fn_flat[stage]
+            end
+            fn_flat[1] .= Γ_SR_new_flat
+            iteration += 1
+        end
+
+        if method.verbose
+            print("Converged after $iteration iterations, ")
+            println("the error is $(round(err, digits=ceil(Int, 1-log10(err)))).")
+        end
+        c = C_SR ./ r + φ
+        ĉ = C_SR_hat ./ k + φ_hat
+        γ = Γ_SR_new ./ r + q - φ
+        γ̂ = Γ_SR_hat ./ k + q_hat - φ_hat
+
+        Γ_SR_prev = Γ_SR_new
+        #gr = find_g_from_c_and_γ(c, γ)
+        #gr = convert_vecofmat_to_3darr(gr)
+        #gamma_0 = gr .- one(eltype(gr)) .- c
+        solutions[ll] = construct_solution(r, k, c, ĉ, γ, γ̂, ρ)
+    end
+    return solutions
 end
 
 
