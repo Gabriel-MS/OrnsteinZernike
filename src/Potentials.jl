@@ -76,23 +76,31 @@ end
 CompositePotential(pots::Vararg{Potential,N}) where N = CompositePotential{Tuple{Vararg{Potential,N}}}(pots)
 
 # Evaluate total potential at scalar r
-function evaluate_potential(p::CompositePotential, r::Number)
-    # Evaluate each potential
-    u = evaluate_potential(first(p.potentials), r)
-    for pot in Iterators.rest(p.potentials)
-        u = u + evaluate_potential(pot, r)  # elementwise sum (broadcast)
-    end
-    return u
-end
+#function evaluate_potential(p::CompositePotential, r::Number)
+#    # Evaluate each potential
+#    u = evaluate_potential(first(p.potentials), r)
+#    for pot in Iterators.rest(p.potentials)
+#        u = u + evaluate_potential(pot, r)  # elementwise sum (broadcast)
+#    end
+#    return u
+#end
 
 
 # Evaluate derivative of total potential at scalar r
+#function evaluate_potential_derivative(p::CompositePotential, r::Number)
+#    du = evaluate_potential_derivative(first(p.potentials), r)
+#    for pot in Iterators.rest(p.potentials)
+#        du = du + evaluate_potential_derivative(pot, r)
+#    end
+#    return du
+#end
+
+function evaluate_potential(p::CompositePotential, r::Number)
+    return sum(pot -> evaluate_potential(pot, r), p.potentials)
+end
+
 function evaluate_potential_derivative(p::CompositePotential, r::Number)
-    du = evaluate_potential_derivative(first(p.potentials), r)
-    for pot in Iterators.rest(p.potentials)
-        du = du + evaluate_potential_derivative(pot, r)
-    end
-    return du
+    return sum(pot -> evaluate_potential_derivative(pot, r), p.potentials)
 end
 
 # Discontinuities: union of all potentials
